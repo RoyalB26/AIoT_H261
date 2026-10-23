@@ -2,8 +2,9 @@
 train_baseline/train.py
 
 Training Pipeline for Patchcore Anomaly Detection on Industrial Datasets.
-Supports MVTec AD, VisA, and PCB Defect Dataset with full checkpointing,
-reproducible seeding, evaluation metric logging, and model export (CKPT & ONNX).
+Supports custom dataset structures (MVTec-compatible and VisA-compatible formats)
+with automatic directory validation, full checkpointing, reproducible evaluation metric logging,
+and model export (CKPT & ONNX).
 """
 
 import os
@@ -11,37 +12,42 @@ import sys
 import time
 import argparse
 from pathlib import Path
-from typing import List, Dict, Any, Optional
+from typing import List, Dict, Any, Optional, Tuple
 
 import pandas as pd
+from pandas import DataFrame
 import torch
 
 # Fix Windows unicode path issue in anomalib path validation
 import anomalib.data.utils.path as path_module
+import anomalib.data.datasets.image.mvtecad as mv_module
+
 path_module.contains_non_printable_characters = lambda p: False
+path_module.validate_path = lambda p: p
+mv_module.validate_path = lambda p: p
 
 from anomalib.data import MVTecAD, Visa
 from anomalib.models import Patchcore
 from anomalib.engine import Engine
 import anomalib.models.image.patchcore.torch_model as tm
-import anomalib.data.datasets.image.mvtecad as mv_module
 
 # Enable Tensor Core optimizations
 torch.set_float32_matmul_precision('high')
 
+VALID_IMAGE_EXTENSIONS = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff')
+
 
 def patch_mvtec_ad_dataset():
     """
-    Patches anomalib's make_mvtec_ad_dataset to support custom datasets
-    such as the PCB Defect Dataset without throwing Pandas index mismatch errors.
+    Patches anomalib's make_mvtec_ad_dataset to robustly support arbitrary
+    datasets following the standard MVTec folder format without Pandas indexing mismatch errors.
     """
     def custom_make_mvtec_ad_dataset(root, split=None, extensions=None):
-        from pandas import DataFrame
         root = Path(root)
         samples_list = [
             (str(root), *f.parts[-3:])
             for f in root.glob('**/*')
-            if f.suffix.lower() in ('.png', '.jpg', '.jpeg')
+            if f.suffix.lower() in VALID_IMAGE_EXTENSIONS
         ]
         samples = DataFrame(samples_list, columns=['path', 'split', 'label', 'image_path'])
         samples['image_path'] = samples.path + '/' + samples.split + '/' + samples.label + '/' + samples.image_path
@@ -89,33 +95,137 @@ def patch_memory_efficient_subsample():
     tm.PatchcoreModel.subsample_embedding = fast_subsample
 
 
-def get_dataset_categories(dataset_name: str, root_dir: Path) -> List[str]:
+def validate_category_structure(root_dir: Path, category: str) -> str:
     """
-    Returns available categories for the given dataset.
+    Inspects the category directory structure under root_dir and validates
+    that all mandatory subdirectories and images exist.
+
+    Supported formats:
+    1. 'mvtec' format:
+       <root_dir>/<category>/
+         ├── train/good/          (mandatory: non-empty folder with normal images)
+         └── test/                (mandatory: contains 'good' and/or defect subfolders)
+         └── ground_truth/        (optional: binary defect masks)
+
+    2. 'visa' format:
+       <root_dir>/<category>/
+         └── Data/
+             └── Images/
+                 ├── Normal/      (mandatory: normal images)
+                 └── Anomaly/     (mandatory: defect images)
 
     Args:
-        dataset_name (str): Name of dataset ('mvtec', 'visa', or 'pcb').
-        root_dir (Path): Dataset root path.
+        root_dir (Path): Root directory containing the category folder.
+        category (str): Name of the category.
 
     Returns:
-        List[str]: List of category names.
+        str: Detected format ('mvtec' or 'visa').
+
+    Raises:
+        FileNotFoundError: If root directory or category directory does not exist.
+        ValueError: If directory structure does not meet required specifications.
     """
-    ds = dataset_name.lower()
-    if ds in ("mvtec", "mvtec_ad"):
-        return sorted([d.name for d in root_dir.iterdir() if d.is_dir() and not d.name.startswith('.')])
-    elif ds == "visa":
-        return [
-            "candle", "capsules", "cashew", "chewinggum", "fryum",
-            "macaroni1", "macaroni2", "pcb1", "pcb2", "pcb3", "pcb4", "pipe_fryum"
+    cat_dir = root_dir / category
+    if not cat_dir.exists() or not cat_dir.is_dir():
+        raise FileNotFoundError(
+            f"Category folder not found: '{cat_dir}'. "
+            f"Please ensure '{category}' exists inside root directory '{root_dir}'."
+        )
+
+    # Check for MVTec format: train/good and test
+    train_dir = cat_dir / "train"
+    train_good_dir = train_dir / "good"
+    test_dir = cat_dir / "test"
+
+    # Check for VisA format: Data/Images/Normal and Data/Images/Anomaly
+    visa_normal_dir = cat_dir / "Data" / "Images" / "Normal"
+    visa_anomaly_dir = cat_dir / "Data" / "Images" / "Anomaly"
+
+    if train_good_dir.is_dir() and test_dir.is_dir():
+        # Validate train/good contains valid images
+        train_images = [
+            f for f in train_good_dir.iterdir()
+            if f.is_file() and f.suffix.lower() in VALID_IMAGE_EXTENSIONS
         ]
-    elif ds in ("pcb", "pcb_defect"):
-        return ["missing_hole", "mouse_bite", "open_circuit", "short", "spur", "spurious_copper"]
+        if not train_images:
+            raise ValueError(
+                f"Invalid directory structure for category '{category}' at '{cat_dir}':\n"
+                f"  'train/good/' folder was found but contains no supported images "
+                f"({', '.join(VALID_IMAGE_EXTENSIONS)})."
+            )
+
+        # Validate test folder contains images or subfolders
+        test_images = [
+            f for f in test_dir.rglob("*")
+            if f.is_file() and f.suffix.lower() in VALID_IMAGE_EXTENSIONS
+        ]
+        if not test_images:
+            raise ValueError(
+                f"Invalid directory structure for category '{category}' at '{cat_dir}':\n"
+                f"  'test/' folder was found but contains no supported images "
+                f"({', '.join(VALID_IMAGE_EXTENSIONS)})."
+            )
+
+        return "mvtec"
+
+    elif visa_normal_dir.is_dir() and visa_anomaly_dir.is_dir():
+        normal_images = [
+            f for f in visa_normal_dir.iterdir()
+            if f.is_file() and f.suffix.lower() in VALID_IMAGE_EXTENSIONS
+        ]
+        if not normal_images:
+            raise ValueError(
+                f"Invalid VisA structure for category '{category}' at '{cat_dir}':\n"
+                f"  'Data/Images/Normal/' contains no supported images."
+            )
+        return "visa"
+
     else:
-        raise ValueError(f"Unsupported dataset: {dataset_name}. Choose from: mvtec, visa, pcb.")
+        found_subdirs = [d.name for d in cat_dir.iterdir() if d.is_dir()]
+        raise ValueError(
+            f"Invalid dataset structure for category '{category}' at '{cat_dir}'.\n"
+            f"Found subdirectories: {found_subdirs}\n"
+            f"The directory must match one of the following formats:\n"
+            f"  1. Standard MVTec format:\n"
+            f"     {cat_dir}/\n"
+            f"     ├── train/\n"
+            f"     │   └── good/             <-- Mandatory: normal training images\n"
+            f"     ├── test/                 <-- Mandatory: contains test images ('good', defect classes)\n"
+            f"     └── ground_truth/         <-- Optional: defect segmentation masks\n\n"
+            f"  2. VisA format:\n"
+            f"     {cat_dir}/\n"
+            f"     └── Data/\n"
+            f"         └── Images/\n"
+            f"             ├── Normal/       <-- Mandatory: normal images\n"
+            f"             └── Anomaly/      <-- Mandatory: anomaly images\n"
+        )
+
+
+def discover_categories(root_dir: Path) -> List[str]:
+    """
+    Discovers valid categories present in root_dir.
+    """
+    if not root_dir.exists() or not root_dir.is_dir():
+        raise FileNotFoundError(f"Root directory does not exist or is not a directory: '{root_dir}'")
+
+    subdirs = sorted([d.name for d in root_dir.iterdir() if d.is_dir() and not d.name.startswith('.')])
+    valid_categories = []
+
+    for name in subdirs:
+        try:
+            validate_category_structure(root_dir, name)
+            valid_categories.append(name)
+        except Exception:
+            continue
+
+    if not valid_categories:
+        # If none validated immediately, return all subdirectories so that explicit validation gives detailed errors
+        return subdirs
+
+    return valid_categories
 
 
 def train_single_category(
-    dataset_name: str,
     root_dir: Path,
     category: str,
     backbone: str = "resnet18",
@@ -126,12 +236,11 @@ def train_single_category(
     export_onnx: bool = True
 ) -> Dict[str, Any]:
     """
-    Trains and validates a Patchcore model for a specific category.
+    Validates structure and trains a Patchcore model for a specific category.
 
     Args:
-        dataset_name (str): 'mvtec', 'visa', or 'pcb'.
-        root_dir (Path): Root folder containing the dataset.
-        category (str): Name of the object or defect class.
+        root_dir (Path): Root folder containing category directories.
+        category (str): Name of the category.
         backbone (str): Pretrained feature extractor backbone. Defaults to 'resnet18'.
         batch_size (int): Training and evaluation batch size. Defaults to 32.
         coreset_ratio (float): Ratio of patch embeddings to keep in memory bank. Defaults to 0.01.
@@ -142,17 +251,18 @@ def train_single_category(
     Returns:
         Dict[str, Any]: Dictionary containing training and testing performance metrics.
     """
-    ds = dataset_name.lower()
-    cat_output_dir = output_dir / ds / category
-    cat_output_dir.mkdir(parents=True, exist_ok=True)
-
     print(f"\n=======================================================")
-    print(f"Dataset: {dataset_name.upper()} | Category: {category}")
+    print(f"Validating dataset structure for category: '{category}'...")
+    data_format = validate_category_structure(root_dir, category)
+    print(f"Format detected: '{data_format.upper()}' | Validation passed successfully!")
     print(f"Backbone: {backbone} | Batch Size: {batch_size}")
     print(f"=======================================================")
 
-    # Initialize Datamodule
-    if ds in ("mvtec", "mvtec_ad", "pcb", "pcb_defect"):
+    cat_output_dir = output_dir / category
+    cat_output_dir.mkdir(parents=True, exist_ok=True)
+
+    # Initialize Datamodule according to detected format
+    if data_format == "mvtec":
         datamodule = MVTecAD(
             root=root_dir,
             category=category,
@@ -160,7 +270,7 @@ def train_single_category(
             eval_batch_size=batch_size,
             num_workers=num_workers,
         )
-    elif ds == "visa":
+    elif data_format == "visa":
         datamodule = Visa(
             root=root_dir,
             category=category,
@@ -169,7 +279,7 @@ def train_single_category(
             num_workers=num_workers,
         )
     else:
-        raise ValueError(f"Unknown dataset {dataset_name}")
+        raise ValueError(f"Unsupported format: {data_format}")
 
     # Initialize Model
     model = Patchcore(
@@ -218,8 +328,8 @@ def train_single_category(
             print(f"Warning: ONNX export skipped due to: {e}")
 
     result_entry = {
-        "Dataset": dataset_name,
         "Category": category,
+        "Format": data_format,
         "Backbone": backbone,
         "Train Samples": train_samples,
         "Test Samples": test_samples,
@@ -240,13 +350,11 @@ def main():
     """
     Main entry point for training CLI.
     """
-    parser = argparse.ArgumentParser(description="Patchcore Anomaly Detection Training Baseline")
-    parser.add_argument("--dataset", type=str, default="mvtec", choices=["mvtec", "visa", "pcb", "all"],
-                        help="Dataset to train on (mvtec, visa, pcb, or all).")
+    parser = argparse.ArgumentParser(description="Patchcore Anomaly Detection Training Pipeline")
+    parser.add_argument("--root_dir", type=str, required=True,
+                        help="Root directory of the dataset.")
     parser.add_argument("--category", type=str, default=None,
-                        help="Specific category to train. If None, trains on all categories of the dataset.")
-    parser.add_argument("--data_root", type=str, default=None,
-                        help="Root directory of the selected dataset. Uses default project path if omitted.")
+                        help="Category to train. If omitted, automatically discovers and trains all valid categories in root_dir.")
     parser.add_argument("--backbone", type=str, default="resnet18",
                         help="Backbone feature extractor (e.g., resnet18, wide_resnet50_2).")
     parser.add_argument("--batch_size", type=int, default=32, help="DataLoader batch size.")
@@ -258,35 +366,38 @@ def main():
     patch_mvtec_ad_dataset()
     patch_memory_efficient_subsample()
 
-    default_roots = {
-        "mvtec": Path(r"D:\apps\Datasets\MVTec AD"),
-        "visa": Path(r"D:\Study\University\H261\Đa ngành\VisA_20220922"),
-        "pcb": Path(r"D:\Study\University\H261\Đa ngành\pcb-defect-dataset\pcb_mvtec_format"),
-    }
+    root = Path(args.root_dir)
+    if not root.exists():
+        raise FileNotFoundError(f"Root directory does not exist: {root}")
 
-    datasets_to_run = ["mvtec", "visa", "pcb"] if args.dataset == "all" else [args.dataset]
+    if args.category:
+        # Validate specified category
+        validate_category_structure(root, args.category)
+        categories = [args.category]
+    else:
+        categories = discover_categories(root)
+        if not categories:
+            raise ValueError(f"No valid category folders found in root directory: {root}")
+        print(f"Discovered {len(categories)} categories to train: {categories}")
+
     all_summary = []
-
-    for ds in datasets_to_run:
-        root = Path(args.data_root) if args.data_root else default_roots[ds]
-        categories = [args.category] if args.category else get_dataset_categories(ds, root)
-
-        for cat in categories:
-            res = train_single_category(
-                dataset_name=ds,
-                root_dir=root,
-                category=cat,
-                backbone=args.backbone,
-                batch_size=args.batch_size,
-                coreset_ratio=args.coreset_ratio,
-                output_dir=Path(args.output_dir),
-                export_onnx=args.export_onnx,
-            )
-            all_summary.append(res)
+    for cat in categories:
+        res = train_single_category(
+            root_dir=root,
+            category=cat,
+            backbone=args.backbone,
+            batch_size=args.batch_size,
+            coreset_ratio=args.coreset_ratio,
+            output_dir=Path(args.output_dir),
+            export_onnx=args.export_onnx,
+        )
+        all_summary.append(res)
 
     # Save summary report
     summary_df = pd.DataFrame(all_summary)
-    summary_csv = Path(args.output_dir) / "training_summary.csv"
+    output_path = Path(args.output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+    summary_csv = output_path / "training_summary.csv"
     summary_df.to_csv(summary_csv, index=False)
     print("\n" + "=" * 60)
     print(f"Training completed successfully! Summary saved to: {summary_csv}")

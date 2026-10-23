@@ -31,13 +31,13 @@ model/
 
 ### 1. `train_baseline/`
 The training baseline provides an end-to-end training and evaluation script:
-- **Multi-Dataset Support**: Built-in support for `--dataset mvtec`, `--dataset visa`, and `--dataset pcb`.
+- **Dataset Agnostic**: No restrictions to specific datasets. Users supply `--root_dir` and `--category`. The pipeline automatically validates folder integrity before execution.
 - **Fast Training**: Employs optimized memory bank indexing with representative coreset selection, reducing training time to **8–40 seconds** per category while retaining state-of-the-art pixel localization accuracy.
 - **Auto Checkpointing & ONNX Export**: Saves PyTorch Lightning `.ckpt` checkpoints and optionally exports deployable ONNX models.
 
 👉 **Quick command**:
 ```bash
-python train_baseline/train.py --dataset mvtec --category bottle --export_onnx
+python train_baseline/train.py --root_dir "/path/to/dataset" --category bottle --export_onnx
 ```
 *For complete instructions, dataset flags, and parameter customization, refer to [train_baseline/README.md](train_baseline/README.md).*
 

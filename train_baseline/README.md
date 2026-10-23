@@ -1,16 +1,19 @@
 # Patchcore Training Baseline
 
-Modular training pipeline for **Patchcore Anomaly Detection & Localization** on industrial visual quality inspection datasets (**MVTec AD**, **VisA**, and **PCB Defect Dataset**).
+Modular training pipeline for **Patchcore Anomaly Detection & Localization** on arbitrary industrial visual inspection datasets.
+
+The training pipeline is fully dataset-agnostic: it does not enforce a hardcoded dataset name or rely on default dataset paths. Instead, you supply your dataset root directory (`--root_dir`) and optionally target a specific category (`--category`). The pipeline automatically validates your folder structure before execution, raising informative errors if the structure is missing required files or subdirectories.
 
 ---
 
 ## 📌 Features
 
-- **Multi-Dataset Support**: Seamlessly trains on MVTec AD (15 categories), VisA (12 categories), and PCB Defect Dataset (6 defect types).
-- **Fast Representative Coreset**: Employs an optimized GPU/CPU memory bank builder preventing Out-of-Memory and execution bottlenecks.
-- **Windows & Unicode Path Safe**: Built-in path sanitizer supporting Vietnamese and Unicode workspace directories.
-- **Automatic Exporting**: Saves PyTorch Lightning checkpoints (`.ckpt`) and exports optimized **ONNX** graph representations (`.onnx`).
-- **Comprehensive Logging**: Auto-logs training duration, testing latency, Image AUROC, Pixel AUROC, and F1-Scores to CSV.
+- **Dataset Agnostic**: No hardcoded datasets or default paths. Supports any custom dataset complying with standard anomaly detection formats (MVTec-style or VisA-style).
+- **Automatic Structure Validation**: Verifies directory hierarchy, mandatory normal training images, and test images before running training.
+- **Fast Representative Coreset**: Employs an optimized memory bank builder preventing Out-of-Memory and execution bottlenecks.
+- **Windows & Unicode Path Safe**: Built-in path sanitizer supporting Unicode directory paths.
+- **Automatic Checkpointing & ONNX Export**: Saves PyTorch Lightning checkpoints (`.ckpt`) and exports deployable **ONNX** graphs (`.onnx`).
+- **Comprehensive Logging**: Auto-logs training duration, testing latency, Image AUROC, Pixel AUROC, and F1-Scores to a CSV report.
 
 ---
 
@@ -26,46 +29,94 @@ train_baseline/
 
 ## 🚀 Quickstart & Usage
 
-### 1. Train a Specific Category (e.g. `bottle` in MVTec AD)
+> **Important**: There are no default datasets. Users must provide `--root_dir`.
+
+### 1. Train a Specific Category
 ```bash
-python train_baseline/train.py --dataset mvtec --category bottle --backbone resnet18 --export_onnx
+python train_baseline/train.py --root_dir "/path/to/dataset" --category bottle --backbone resnet18 --export_onnx
 ```
 
-### 2. Train an Entire Dataset (e.g. all 6 PCB Defect categories)
+### 2. Automatically Discover and Train All Categories in Root
+If `--category` is omitted, the script automatically scans `--root_dir`, validates all category subfolders, and trains them sequentially:
 ```bash
-python train_baseline/train.py --dataset pcb --output_dir ./checkpoints
+python train_baseline/train.py --root_dir "/path/to/dataset" --output_dir ./checkpoints --export_onnx
 ```
 
-### 3. Train all 33 Categories across all Datasets
+### 3. Custom Batch Size and Coreset Ratio
 ```bash
-python train_baseline/train.py --dataset all --batch_size 32 --coreset_ratio 0.01
+python train_baseline/train.py --root_dir "/path/to/dataset" --category candle --batch_size 32 --coreset_ratio 0.01
+```
+
+---
+
+## 🗂️ Required Dataset Structure
+
+Before starting training, the script checks if your category directory matches one of the supported structures. If any mandatory folder or image is missing, an explicit error message is displayed.
+
+### Format 1: Standard MVTec AD Format (Recommended for custom datasets)
+
+```text
+<root_dir>/
+├── <category_name>/
+│   ├── train/
+│   │   └── good/                 # MANDATORY: Normal (defect-free) images for memory bank
+│   │       ├── 000.png
+│   │       └── ...
+│   ├── test/                     # MANDATORY: Evaluation images
+│   │   ├── good/                 # (Optional/Recommended) Defect-free test images
+│   │   │   └── 000.png
+│   │   └── <defect_type>/        # Defective images (e.g. scratch, crack, broken, ...)
+│   │       └── 000.png
+│   └── ground_truth/             # (Optional) Binary pixel-level masks (.png)
+│       └── <defect_type>/
+│           └── 000_mask.png      # Mask corresponding to test/<defect_type>/000.png
+```
+
+**Requirements**:
+- `train/good/` must contain at least one valid image (`.png`, `.jpg`, `.jpeg`, `.bmp`, `.tiff`).
+- `test/` must contain valid test images in subdirectories.
+- `ground_truth/` is optional; if present, pixel AUROC and pixel F1-score are automatically computed.
+
+---
+
+### Format 2: VisA Format
+
+```text
+<root_dir>/
+├── <category_name>/
+│   ├── Data/
+│   │   ├── Images/
+│   │   │   ├── Normal/           # MANDATORY: Normal images
+│   │   │   └── Anomaly/          # MANDATORY: Defective images
+│   │   └── Masks/                # (Optional) Pixel ground truth masks
+│   │       └── Anomaly/
+│   └── image_anno.csv            # (Optional) Split metadata file
 ```
 
 ---
 
 ## ⚙️ Command-Line Arguments
 
-| Argument | Type | Default | Description |
-| :--- | :---: | :---: | :--- |
-| `--dataset` | `str` | `mvtec` | Dataset name: `mvtec`, `visa`, `pcb`, or `all`. |
-| `--category` | `str` | `None` | Specific category. If omitted, trains all categories in the dataset. |
-| `--data_root` | `str` | `None` | Path to dataset root directory (uses default project path if omitted). |
-| `--backbone` | `str` | `resnet18` | Pretrained feature extractor backbone (e.g. `resnet18`, `wide_resnet50_2`). |
-| `--batch_size` | `int` | `32` | DataLoader batch size for training and testing. |
-| `--coreset_ratio` | `float`| `0.01` | Sampling ratio for representative patch memory bank subsampling. |
-| `--output_dir` | `str` | `./checkpoints` | Target directory for saving model checkpoints and export files. |
-| `--export_onnx` | `flag`| `False` | When specified, exports the fitted model to ONNX format. |
+| Argument | Type | Required | Default | Description |
+| :--- | :---: | :---: | :---: | :--- |
+| `--root_dir` | `str` | **Yes** | - | Path to dataset root directory containing category folders. |
+| `--category` | `str` | No | `None` | Target category to train. If omitted, automatically discovers and trains all valid category folders in `root_dir`. |
+| `--backbone` | `str` | No | `resnet18` | Pretrained feature extractor backbone (e.g., `resnet18`, `wide_resnet50_2`). |
+| `--batch_size` | `int` | No | `32` | DataLoader batch size for training and evaluation. |
+| `--coreset_ratio` | `float`| No | `0.01` | Subsampling ratio for representative patch memory bank (0.01 = 1%). |
+| `--output_dir` | `str` | No | `./checkpoints` | Directory to save checkpoints, exported ONNX models, and metrics report. |
+| `--export_onnx` | `flag`| No | `False` | When specified, exports the trained model to ONNX format. |
 
 ---
 
-## 📊 Outputs & Artifacts
+## 📊 Outputs & Checkpoints
 
-After training, models and logs are organized as:
+After training completes, outputs are organized as follows:
+
 ```text
 checkpoints/
-├── mvtec/
-│   └── bottle/
-│       ├── weights/lightning/model.ckpt  # PyTorch model weights & memory bank
-│       └── onnx/model.onnx               # Exported ONNX graph
-└── training_summary.csv                  # Aggregated metric results
+├── <category_name>/
+│   ├── weights/lightning/model.ckpt  # PyTorch model weights & memory bank
+│   └── onnx/model.onnx               # Exported ONNX graph (if --export_onnx is set)
+└── training_summary.csv              # Aggregated evaluation metrics for all trained categories
 ```
